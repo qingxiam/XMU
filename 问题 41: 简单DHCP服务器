@@ -1,0 +1,141 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
+#define DHCP_SERVER_PORT 67
+#define DHCP_CLIENT_PORT 68
+#define FIXED_IP "192.168.1.2"
+
+struct dhcp_packet {
+    uint8_t op;
+    uint8_t htype;
+    uint8_t hlen;
+    uint8_t hops;
+    uint32_t xid;
+    uint16_t secs;
+    uint16_t flags;
+    struct in_addr ciaddr;
+    struct in_addr yiaddr;
+    struct in_addr siaddr;
+    struct in_addr giaddr;
+    uint8_t chaddr[16];
+    uint8_t options[308];
+};
+
+void set_dhcp_option(uint8_t *options, uint8_t code, uint8_t len, const void *data) {
+    *options++ = code;
+    *options++ = len;
+    memcpy(options, data, len);
+}
+
+int main() {
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock < 0) {
+        perror("socket");
+        return 1;
+    }
+
+    struct sockaddr_in server_addr;
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(DHCP_SERVER_PORT);
+    server_addr.sin_addr.s_addr = INADDR_ANY;
+
+    if (bind(sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+        perror("bind");
+        close(sock);
+        return 1;
+    }
+
+    struct dhcp_packet packet;
+    while (1) {
+        struct sockaddr_in client_addr;
+        socklen_t client_len = sizeof(client_addr);
+        ssize_t len = recvfrom(sock, &packet, sizeof(packet), 0, (struct sockaddr*)&client_addr, &client_len);
+        if (len < 0) {
+            perror("recvfrom");
+            continue;
+        }
+
+        // 解析DHCP选项
+        uint8_t *options = packet.options;
+        uint8_t message_type = 0;
+        while (*options != 255 && (options - packet.options) < sizeof(packet.options)) {
+            if (*options == 53) { // DHCP消息类型
+                message_type = *(options + 2);
+                break;
+            }
+            options += 2 + *(options + 1);
+        }
+
+        if (message_type == 1) { // DHCP Discover
+            printf("Received DHCP Discover\n");
+            struct dhcp_packet offer;
+            memset(&offer, 0, sizeof(offer));
+            offer.op = 0x02;
+            offer.htype = packet.htype;
+            offer.hlen = packet.hlen;
+            offer.xid = packet.xid;
+            inet_pton(AF_INET, FIXED_IP, &offer.yiaddr);
+            memcpy(offer.chaddr, packet.chaddr, sizeof(packet.chaddr));
+
+            // 设置选项
+            uint8_t opt[] = {
+                53, 1, 2,    // DHCP Offer
+                54, 4, 192, 168, 1, 1, // DHCP服务器标识
+                51, 4, 0x00, 0x01, 0x51, 0x80, // 租期
+                1, 4, 255, 255, 255, 0, // 子网掩码
+                3, 4, 192, 168, 1, 1, // 路由器
+                6, 4, 8, 8, 8, 8, // DNS
+                255 // 结束
+            };
+            memcpy(offer.options, opt, sizeof(opt));
+
+            struct sockaddr_in dest;
+            memset(&dest, 0, sizeof(dest));
+            dest.sin_family = AF_INET;
+            dest.sin_port = htons(DHCP_CLIENT_PORT);
+            dest.sin_addr.s_addr = INADDR_BROADCAST;
+
+            sendto(sock, &offer, sizeof(offer), 0, (struct sockaddr*)&dest, sizeof(dest));
+            printf("Sent DHCP Offer\n");
+        } else if (message_type == 3) { // DHCP Request
+            printf("Received DHCP Request\n");
+            struct dhcp_packet ack;
+            memset(&ack, 0, sizeof(ack));
+            ack.op = 0x02;
+            ack.htype = packet.htype;
+            ack.hlen = packet.hlen;
+            ack.xid = packet.xid;
+            inet_pton(AF_INET, FIXED_IP, &ack.yiaddr);
+            memcpy(ack.chaddr, packet.chaddr, sizeof(packet.chaddr));
+
+            uint8_t opt[] = {
+                53, 1, 5,    // DHCP ACK
+                54, 4, 192, 168, 1, 1,
+                51, 4, 0x00, 0x01, 0x51, 0x80,
+                1, 4, 255, 255, 255, 0,
+                3, 4, 192, 168, 1, 1,
+                6, 4, 8, 8, 8, 8,
+                255
+            };
+            memcpy(ack.options, opt, sizeof(opt));
+
+            struct sockaddr_in dest;
+            memset(&dest, 0, sizeof(dest));
+            dest.sin_family = AF_INET;
+            dest.sin_port = htons(DHCP_CLIENT_PORT);
+            dest.sin_addr.s_addr = INADDR_BROADCAST;
+
+            sendto(sock, &ack, sizeof(ack), 0, (struct sockaddr*)&dest, sizeof(dest));
+            printf("Sent DHCP ACK\n");
+        }
+    }
+
+    close(sock);
+    return 0;
+}
